@@ -692,6 +692,7 @@ async function api(method, path, body) {
 }
 // A scope switch points this page at a different review; nothing derived from the previous one may carry over.
 function resetForReview() {
+    persistPinnedComposers();
     pinnedComposers.clear();
     composerContexts.clear();
     state.snapshot = null;
@@ -721,11 +722,14 @@ async function loadState() {
             const rev = data.review.currentRevisionId;
             const snapshot = !rev ? null : state.review?.reviewId !== data.review.reviewId || state.snapshot?.revisionId !== rev
                 ? parseSnapshot(await api("GET", `snapshot/${rev}`)) : state.snapshot;
-            if (state.review && state.review.reviewId !== data.review.reviewId)
+            const reviewChanged = state.review?.reviewId !== data.review.reviewId;
+            if (state.review && reviewChanged)
                 resetForReview();
             else if (state.review && state.review.currentRevisionId !== data.review.currentRevisionId)
                 pinComposers();
             state.review = data.review;
+            if (reviewChanged)
+                restorePinnedComposers(data.review.reviewId);
             state.snapshot = snapshot;
             state.reviewSkillsAvailable = data.reviewSkillsAvailable === true;
             state.pullRequest = data.pullRequest ?? null;
@@ -1629,6 +1633,45 @@ function renderMain() {
 }
 const pinnedComposers = new Map();
 const composerContexts = new Map();
+const pinnedComposersKey = (reviewId) => `sr:${reviewId}:pinned-composers`;
+function persistPinnedComposers() {
+    if (!state.review)
+        return;
+    const key = pinnedComposersKey(state.review.reviewId);
+    if (pinnedComposers.size)
+        localStorage.setItem(key, JSON.stringify([...pinnedComposers]));
+    else
+        localStorage.removeItem(key);
+}
+function restorePinnedComposers(reviewId) {
+    pinnedComposers.clear();
+    try {
+        const value = JSON.parse(localStorage.getItem(pinnedComposersKey(reviewId)) ?? "[]");
+        if (!Array.isArray(value))
+            throw new Error("Pinned composers must be an array.");
+        for (const entry of value) {
+            if (!Array.isArray(entry) || typeof entry[0] !== "string" || !isRecord(entry[1]))
+                continue;
+            const [key, options] = entry;
+            if ((options.kind !== "file" && options.kind !== "line" && options.kind !== "change")
+                || typeof options.path !== "string" || typeof options.revisionId !== "string"
+                || (options.side !== undefined && options.side !== "old" && options.side !== "new")
+                || (options.startLine !== undefined && typeof options.startLine !== "number")
+                || (options.endLine !== undefined && typeof options.endLine !== "number")
+                || (options.label !== undefined && typeof options.label !== "string")
+                || (options.placeholder !== undefined && typeof options.placeholder !== "string"))
+                continue;
+            pinnedComposers.set(key, {
+                kind: options.kind, path: options.path, revisionId: options.revisionId, alwaysOpen: true,
+                side: options.side, startLine: options.startLine, endLine: options.endLine,
+                label: options.label, placeholder: options.placeholder,
+            });
+        }
+    }
+    catch {
+        localStorage.removeItem(pinnedComposersKey(reviewId));
+    }
+}
 function pinComposers() {
     const pin = (key, options) => {
         if (pinnedComposers.has(key))
@@ -1671,6 +1714,7 @@ function pinComposers() {
         pin(key, options);
     // Row indices belong to the previous snapshot, never to the refreshed diff.
     state.selection = null;
+    persistPinnedComposers();
 }
 function composerHtml(key, { label, placeholder, kind, path, side, startLine, endLine, alwaysOpen, revisionId, }) {
     const draft = getDraft(key);
@@ -2062,6 +2106,7 @@ function closeComposer(key, discard) {
         setDraft(key, "");
     state.open.delete(key);
     state.pending.delete(key);
+    persistPinnedComposers();
     if (key.startsWith("line:"))
         state.selection = null;
     if (document.activeElement instanceof HTMLElement && document.activeElement.dataset.composer === key)
@@ -2119,6 +2164,7 @@ async function submit(key, draft = defaultDraft()) {
         composerContexts.delete(sentKey);
         state.pending.delete(sentKey);
         state.open.delete(sentKey);
+        persistPinnedComposers();
         if (sentKey.startsWith("line:"))
             state.selection = null;
         if (document.activeElement instanceof HTMLElement)

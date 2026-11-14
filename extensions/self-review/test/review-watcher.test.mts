@@ -64,13 +64,22 @@ test("debounce waits for the last event and releases every watcher and pending t
     t.mock.timers.tick(1);
     await refreshed;
     assert.equal(calls, 2, "the burst produces exactly one refresh");
+    await writeFile(path.join(f.repo, "file.ts"), "changed during continuous watcher noise\n");
+    const boundedRefresh = new Promise<void>((resolve) => { notify = resolve; });
+    source.change("file.ts");
+    for (let i = 0; i < 15; i++) {
+        t.mock.timers.tick(100);
+        source.change("ignored-output.log");
+    }
+    await boundedRefresh;
+    assert.equal(calls, 3, "continuous events cannot postpone a relevant refresh beyond the maximum wait");
     source.fail(new Error("watch failed"));
     assert.ok(source.closed);
     assert.match(f.logs[0] ?? "", /watch failed.*Manual Refresh remains available/);
     source.change("file.ts");
     await watcher.close();
     t.mock.timers.tick(500);
-    assert.equal(calls, 2, "close cancels the queued refresh");
+    assert.equal(calls, 3, "close cancels the queued refresh");
     assert.ok([...sources.values()].every((entry) => entry.closed));
 });
 
@@ -138,14 +147,31 @@ test("submodule working files and stored HEAD metadata trigger superproject refr
     const source = path.join(f.tmp, "submodule-source");
     await runGit(f.tmp, ["init", "-q", "-b", "main", source]);
     await writeFile(path.join(source, "nested.ts"), "base\n");
+    await writeFile(path.join(source, ".gitignore"), "node_modules/\n");
     await runGit(source, ["add", "."]);
     await runGit(source, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base"]);
     await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "vendor/lib");
     await f.git("commit", "-qam", "submodule");
     await f.watcher.setReview(f.id);
     const submodule = path.join(f.repo, "vendor", "lib");
+    const beforeTracked = f.count();
     await writeFile(path.join(submodule, "nested.ts"), "dirty\n");
     await until(async () => (await f.service.getSnapshot(f.id)).files.some((file) => file.path === "vendor/lib"));
+    await until(() => f.count() > beforeTracked);
+    const afterTrackedEdit = f.count();
+    await mkdir(path.join(submodule, "node_modules"));
+    await writeFile(path.join(submodule, "node_modules", "output.js"), "ignored\n");
+    assert.equal((await runGit(submodule, ["check-ignore", "node_modules/output.js"])).stdout.trim(), "node_modules/output.js");
+    assert.ok(!(await runGit(submodule, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"])).stdout.includes("node_modules/output.js"));
+    await delay(1800);
+    assert.equal(f.count(), afterTrackedEdit, "ignored submodule output does not trigger a superproject refresh");
+    const beforeUntracked = f.count();
+    const untracked = path.join(submodule, "new.ts");
+    await writeFile(untracked, "untracked review content\n");
+    await until(() => f.count() > beforeUntracked);
+    const beforeDelete = f.count();
+    await rm(untracked);
+    await until(() => f.count() > beforeDelete);
     const before = f.count();
     await runGit(submodule, ["add", "."]);
     await runGit(submodule, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "updated"]);

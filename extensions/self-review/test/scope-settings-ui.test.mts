@@ -76,6 +76,7 @@ interface LoadedApp {
         activeElement: MockFocusable | null;
     };
     sessionStorage: ReturnType<typeof mockStorage>;
+    localStorage: ReturnType<typeof mockStorage>;
     focused: string[];
     node: (selector: string) => MockNode;
     state: RuntimeState;
@@ -113,13 +114,14 @@ async function loadApp(globals: Record<string, unknown> & { fetch?: MockFetch } 
     };
     const document = { addEventListener() {}, querySelector: node, querySelectorAll: (_selector: string) => [] as MockFocusable[], activeElement: null as MockFocusable | null };
     const sessionStorage = mockStorage();
+    const localStorage = (globals.localStorage as ReturnType<typeof mockStorage> | undefined) ?? mockStorage();
     const context = vm.createContext({
-        URLSearchParams, location: { search: "" }, document, localStorage: mockStorage(), sessionStorage,
+        URLSearchParams, location: { search: "" }, document, localStorage, sessionStorage,
         window: { setTimeout: () => 0 }, setInterval() {}, setTimeout: () => 0, clearTimeout() {}, ...globals,
     });
     await runApp(context);
     return {
-        document, sessionStorage, focused, node,
+        document, sessionStorage, localStorage, focused, node,
         state: vm.runInContext("state", context) as RuntimeState,
             run: Object.assign((code: string) => vm.runInContext(code, context) as unknown, {}) as LoadedApp["run"],
         read: <T = unknown,>(expression: string) => JSON.parse(vm.runInContext(`JSON.stringify(${expression})`, context)) as T,
@@ -960,6 +962,37 @@ test("an in-flight submission completes the migrated draft without deleting a ne
     await submitted;
     assert.equal(app.read("pinnedComposers.size"), 0);
     assert.equal(app.run(`getDraft("line:file.ts:new:2-2")`), "new feedback");
+});
+
+test("pinned composer text and original revision survive reload and scope switches", async () => {
+    let activeReview = reviewFixture();
+    const fetch: MockFetch = async (url) => {
+        if (url === "/api/state") return jsonResponse({ review: activeReview, settings: settingsFixture() });
+        if (url.startsWith("/api/snapshot/")) return jsonResponse({ revisionId: activeReview.currentRevisionId, files: [] });
+        throw new Error(`unexpected request ${url}`);
+    };
+    const app = await loadApp({ fetch });
+    app.run("renderRuler = () => {}");
+    await app.run("loadState()");
+    const key = "line:file.ts:new:2-2";
+    app.run(`composerHtml(${JSON.stringify(key)}, { kind: "line", path: "file.ts", side: "new", startLine: 2, endLine: 2, revisionId: "r1", alwaysOpen: true }); setDraft(${JSON.stringify(key)}, "keep across reload"); pinComposers()`);
+    const pinnedKey = `pinned:r1:${key}`;
+    assert.ok(app.localStorage.getItem("sr:r:draft:" + pinnedKey));
+    assert.ok(app.localStorage.getItem("sr:r:pinned-composers"));
+
+    activeReview = reviewFixture({ reviewId: "pending-review", currentRevisionId: "p1", scope: "pending" });
+    await app.run("loadState()");
+    assert.equal(app.read("pinnedComposers.size"), 0, "another scope does not display this draft");
+    activeReview = reviewFixture();
+    await app.run("loadState()");
+    assert.equal(app.read(`pinnedComposers.get(${JSON.stringify(pinnedKey)}).revisionId`), "r1");
+    assert.match(app.run(`composerHtml(${JSON.stringify(pinnedKey)}, pinnedComposers.get(${JSON.stringify(pinnedKey)}))`), /keep across reload/);
+
+    const reloaded = await loadApp({ fetch, localStorage: app.localStorage });
+    reloaded.run("renderRuler = () => {}");
+    await reloaded.run("loadState()");
+    assert.equal(reloaded.read(`pinnedComposers.get(${JSON.stringify(pinnedKey)}).revisionId`), "r1");
+    assert.match(reloaded.run(`composerHtml(${JSON.stringify(pinnedKey)}, pinnedComposers.get(${JSON.stringify(pinnedKey)}))`), /keep across reload/);
 });
 
 test("the top bar shows the review scope, and the learning controls only when the settings are known", async () => {
