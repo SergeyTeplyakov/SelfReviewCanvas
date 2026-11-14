@@ -917,6 +917,9 @@ async function api(method: "GET" | "POST", path: string, body?: unknown): Promis
 
 // A scope switch points this page at a different review; nothing derived from the previous one may carry over.
 function resetForReview() {
+    persistPinnedComposers();
+    pinnedComposers.clear();
+    composerContexts.clear();
     state.snapshot = null;
     state.view = { type: "overview" };
     state.selection = null;
@@ -942,8 +945,15 @@ async function loadState() {
         do {
             reloadAgain = false;
             const data = parseState(await api("GET", "state"));
-            if (state.review && state.review.reviewId !== data.review.reviewId) resetForReview();
+            const rev = data.review.currentRevisionId;
+            const snapshot = !rev ? null : state.review?.reviewId !== data.review.reviewId || state.snapshot?.revisionId !== rev
+                ? parseSnapshot(await api("GET", `snapshot/${rev}`)) : state.snapshot;
+            const reviewChanged = state.review?.reviewId !== data.review.reviewId;
+            if (state.review && reviewChanged) resetForReview();
+            else if (state.review && state.review.currentRevisionId !== data.review.currentRevisionId) pinComposers();
             state.review = data.review;
+            if (reviewChanged) restorePinnedComposers(data.review.reviewId);
+            state.snapshot = snapshot;
             state.reviewSkillsAvailable = data.reviewSkillsAvailable === true;
             state.pullRequest = data.pullRequest ?? null;
             const settingsState = settingsApi.readState(data.settingsPayload);
@@ -954,11 +964,9 @@ async function loadState() {
             state.agentReviewSettingsError = settingsState.agentReviewSettingsError ?? "";
             state.agentReviewSuggestedModels = data.agentReviewSuggestedModels;
             if (data.session) state.busy = data.session.busy;
-            const rev = state.review.currentRevisionId;
-            if (rev && state.snapshot?.revisionId !== rev) state.snapshot = parseSnapshot(await api("GET", `snapshot/${rev}`));
             restoreView();
+            render();
         } while (reloadAgain);
-        render();
     })().finally(() => {
         loading = null;
     });
@@ -1214,6 +1222,11 @@ function render() {
     renderBanner();
     renderSide();
     renderMain();
+    if (pinnedComposers.size) {
+        main.innerHTML = [...pinnedComposers].map(([key, options]) =>
+            `<div class="thread"><div class="muted">Diff changed. This comment keeps its original location in ${esc(options.revisionId)}.</div>${composerHtml(key, options)}</div>`,
+        ).join("") + main.innerHTML;
+    }
     main.scrollTop = scroll;
     renderRuler();
     if (focusKey) {
@@ -1821,9 +1834,7 @@ function renderMain(): void {
     main.innerHTML = state.view.type === "lessons" ? lessonsView() : state.view.type === "agent-comments" ? agentCommentsView() : overviewView();
 }
 
-function composerHtml(key: string, {
-    label, placeholder, kind, path, side, startLine, endLine, alwaysOpen,
-}: {
+type ComposerOptions = {
     label?: string;
     placeholder?: string;
     kind?: ThreadKind;
@@ -1832,12 +1843,96 @@ function composerHtml(key: string, {
     startLine?: number;
     endLine?: number;
     alwaysOpen?: boolean;
-}): string {
+    revisionId?: string;
+};
+const pinnedComposers = new Map<string, ComposerOptions>();
+const composerContexts = new Map<string, ComposerOptions>();
+const pinnedComposersKey = (reviewId: string) => `sr:${reviewId}:pinned-composers`;
+
+function persistPinnedComposers(): void {
+    if (!state.review) return;
+    const key = pinnedComposersKey(state.review.reviewId);
+    if (pinnedComposers.size) localStorage.setItem(key, JSON.stringify([...pinnedComposers]));
+    else localStorage.removeItem(key);
+}
+
+function restorePinnedComposers(reviewId: string): void {
+    pinnedComposers.clear();
+    try {
+        const value: unknown = JSON.parse(localStorage.getItem(pinnedComposersKey(reviewId)) ?? "[]");
+        if (!Array.isArray(value)) throw new Error("Pinned composers must be an array.");
+        for (const entry of value) {
+            if (!Array.isArray(entry) || typeof entry[0] !== "string" || !isRecord(entry[1])) continue;
+            const [key, options] = entry as [string, Record<string, unknown>];
+            if ((options.kind !== "file" && options.kind !== "line" && options.kind !== "change")
+                || typeof options.path !== "string" || typeof options.revisionId !== "string"
+                || (options.side !== undefined && options.side !== "old" && options.side !== "new")
+                || (options.startLine !== undefined && typeof options.startLine !== "number")
+                || (options.endLine !== undefined && typeof options.endLine !== "number")
+                || (options.label !== undefined && typeof options.label !== "string")
+                || (options.placeholder !== undefined && typeof options.placeholder !== "string")) continue;
+            pinnedComposers.set(key, {
+                kind: options.kind, path: options.path, revisionId: options.revisionId, alwaysOpen: true,
+                side: options.side, startLine: options.startLine, endLine: options.endLine,
+                label: options.label, placeholder: options.placeholder,
+            });
+        }
+    } catch {
+        localStorage.removeItem(pinnedComposersKey(reviewId));
+    }
+}
+
+function pinComposers(): void {
+    const pin = (key: string, options: ComposerOptions): string | null => {
+        if (pinnedComposers.has(key)) return null;
+        const draft = getDraft(key);
+        const pending = state.pending.get(key);
+        state.open.delete(key);
+        composerContexts.delete(key);
+        if (!draft && !pending) return null;
+        const pinnedKey = `pinned:${options.revisionId}:${key}`;
+        pinnedComposers.set(pinnedKey, { ...options, alwaysOpen: true });
+        setDraft(pinnedKey, draft);
+        setDraft(key, "");
+        if (pending) {
+            state.pending.set(pinnedKey, pending);
+            state.pending.delete(key);
+        }
+        return pinnedKey;
+    };
+    for (const box of Array.from(document.querySelectorAll<HTMLElement>(".composer[data-kind]"))) {
+        const d = box.dataset;
+        if (!d.key || (d.kind !== "line" && d.kind !== "change" && d.kind !== "file") || pinnedComposers.has(d.key)) continue;
+        const textarea = box.querySelector<HTMLTextAreaElement>("textarea");
+        if (textarea) setDraft(d.key, textarea.value);
+        const pinnedKey = pin(d.key, {
+            kind: d.kind, path: d.path, side: d.side === "old" ? "old" : "new",
+            startLine: d.start ? Number(d.start) : undefined, endLine: d.end ? Number(d.end) : undefined, revisionId: d.revision,
+            label: box.querySelector(".label")?.textContent ?? "Comment on original selection", alwaysOpen: true,
+        });
+        if (pinnedKey) {
+            d.key = pinnedKey;
+            if (textarea) textarea.dataset.composer = pinnedKey;
+        }
+    }
+    for (const [key, options] of composerContexts) pin(key, options);
+    // Row indices belong to the previous snapshot, never to the refreshed diff.
+    state.selection = null;
+    persistPinnedComposers();
+}
+
+function composerHtml(key: string, {
+    label, placeholder, kind, path, side, startLine, endLine, alwaysOpen, revisionId,
+}: ComposerOptions): string {
     const draft = getDraft(key);
     const p = state.pending.get(key);
     const open = alwaysOpen || state.open.has(key) || Boolean(draft) || Boolean(p);
+    if (open && (kind === "line" || kind === "change" || kind === "file") && !pinnedComposers.has(key)) {
+        composerContexts.set(key, { label, placeholder, kind, path, side, startLine, endLine, alwaysOpen: true, revisionId: revisionId ?? state.review?.currentRevisionId ?? undefined });
+    }
     const data = [
         `data-key="${esc(key)}"`,
+        `data-revision="${esc(revisionId ?? state.review?.currentRevisionId ?? "")}"`,
         kind ? `data-kind="${kind}"` : "",
         path ? `data-path="${esc(path)}"` : "",
         side ? `data-side="${side}"` : "",
@@ -2210,9 +2305,12 @@ function revealPendingJump(): void {
 }
 
 function closeComposer(key: string, discard: boolean): void {
+    pinnedComposers.delete(key);
+    composerContexts.delete(key);
     if (discard) setDraft(key, "");
     state.open.delete(key);
     state.pending.delete(key);
+    persistPinnedComposers();
     if (key.startsWith("line:")) state.selection = null;
     if (document.activeElement instanceof HTMLElement && document.activeElement.dataset.composer === key) document.activeElement.blur();
     render();
@@ -2239,6 +2337,7 @@ async function submit(key: string, draft: boolean | undefined = defaultDraft()):
     pending.sending = true;
     pending.error = null;
     state.pending.set(key, pending);
+    const submittedKey = () => [...state.pending].find(([, entry]) => entry === pending)?.[0] ?? key;
     render();
     try {
         let res: unknown;
@@ -2253,17 +2352,21 @@ async function submit(key: string, draft: boolean | undefined = defaultDraft()):
                 side: d.side,
                 startLine: d.start ? Number(d.start) : undefined,
                 endLine: d.end ? Number(d.end) : undefined,
-                revisionId: review.currentRevisionId,
+                revisionId: d.revision || review.currentRevisionId,
                 descriptionVersion: review.description?.version ?? 0,
                 body,
                 clientRequestId: pending.clientRequestId,
                 ...hold,
             });
         }
-        setDraft(key, "");
-        state.pending.delete(key);
-        state.open.delete(key);
-        if (key.startsWith("line:")) state.selection = null;
+        const sentKey = submittedKey();
+        setDraft(sentKey, "");
+        pinnedComposers.delete(sentKey);
+        composerContexts.delete(sentKey);
+        state.pending.delete(sentKey);
+        state.open.delete(sentKey);
+        persistPinnedComposers();
+        if (sentKey.startsWith("line:")) state.selection = null;
         if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
         await loadState();
         if (isRecord(res) && typeof res.threadId === "string" && !key.startsWith("reply:")) {

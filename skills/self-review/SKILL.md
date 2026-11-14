@@ -34,10 +34,18 @@ discuss; they never authorize automatic fixes.
 ## Start the review
 
 The extension injects completion guidance through documented session-start and
-user-prompt hooks. After a completed code-changing task, open or refresh the
-matching human-led review unless the user opts out. This is advisory context,
+user-prompt hooks. After a completed code-changing task, open the matching
+human-led review if none is open, unless the user opts out. Open panels watch
+their checkout and automatically refresh after debounced file or Git comparison
+changes, including edits made outside the agent. Agents need not refresh after
+each edit. Read the review through the discovered action to verify its checkout,
+scope and revision; manual Refresh remains available if watching fails or the
+revision is stale. Keep the same panel and reply in-thread for review comments.
+Automatic refresh preserves the comparison, filters, threads and composer text;
+comments being composed on changed lines keep their original revision.
+Completion-time opening is advisory context,
 not a deterministic completion callback. Verify the actual checkout and
-comparison, discover live schemas, and reuse a matching panel; never reopen
+comparison, pass explicit `repoPath`, discover live schemas, and reuse a matching panel; never reopen
 reviews for read-only work or create a loop while processing review comments.
 If tools or the provider are unavailable, propose the review and state the
 limitation instead. Opening the diff does not authorize an agent review or

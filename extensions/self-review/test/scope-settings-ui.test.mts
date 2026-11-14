@@ -76,6 +76,7 @@ interface LoadedApp {
         activeElement: MockFocusable | null;
     };
     sessionStorage: ReturnType<typeof mockStorage>;
+    localStorage: ReturnType<typeof mockStorage>;
     focused: string[];
     node: (selector: string) => MockNode;
     state: RuntimeState;
@@ -113,13 +114,14 @@ async function loadApp(globals: Record<string, unknown> & { fetch?: MockFetch } 
     };
     const document = { addEventListener() {}, querySelector: node, querySelectorAll: (_selector: string) => [] as MockFocusable[], activeElement: null as MockFocusable | null };
     const sessionStorage = mockStorage();
+    const localStorage = (globals.localStorage as ReturnType<typeof mockStorage> | undefined) ?? mockStorage();
     const context = vm.createContext({
-        URLSearchParams, location: { search: "" }, document, localStorage: mockStorage(), sessionStorage,
+        URLSearchParams, location: { search: "" }, document, localStorage, sessionStorage,
         window: { setTimeout: () => 0 }, setInterval() {}, setTimeout: () => 0, clearTimeout() {}, ...globals,
     });
     await runApp(context);
     return {
-        document, sessionStorage, focused, node,
+        document, sessionStorage, localStorage, focused, node,
         state: vm.runInContext("state", context) as RuntimeState,
             run: Object.assign((code: string) => vm.runInContext(code, context) as unknown, {}) as LoadedApp["run"],
         read: <T = unknown,>(expression: string) => JSON.parse(vm.runInContext(`JSON.stringify(${expression})`, context)) as T,
@@ -831,6 +833,7 @@ test("loads nullable values from review state and labels unavailable upstream co
         git: { branch: "feature", headCommit: "abc", baseCommit: null, upstream: { name: "origin/feature", ahead: null, behind: null }, uncommittedFiles: 0 },
         description: { version: 1, revisionId: null, body: "Draft" },
     });
+
     const app = await loadApp({
         fetch: async (url: string) => {
             if (url === "/api/state") return jsonResponse({ review, session: { busy: null }, settings: settingsFixture() });
@@ -851,6 +854,145 @@ test("loads nullable values from review state and labels unavailable upstream co
     await app.run("loadState()");
     app.run("renderTop()");
     assert.match(app.node("#top").innerHTML, /↑\? ↓\?/);
+});
+
+test("revision reload preserves composer text and posts a changed-line draft against its original revision", async () => {
+    const posts: Record<string, unknown>[] = [];
+    const app = await loadApp({
+        CSS: { escape: (value: string) => value },
+        fetch: async (url: string, options?: { method?: string; body?: string }) => {
+            if (options?.method === "POST") {
+                posts.push(requestBody(options));
+                return jsonResponse({ threadId: "posted" });
+            }
+            if (url === "/api/state") return jsonResponse({ review: reviewFixture({ currentRevisionId: "r2" }), settings: settingsFixture() });
+            if (url === "/api/snapshot/r2") return jsonResponse({ revisionId: "r2", files: [] });
+            throw new Error(`unexpected request ${url}`);
+        },
+    });
+    app.state.review = reviewFixture();
+    app.state.settings = settingsFixture();
+    const key = "line:file.ts:new:2-2";
+    const textarea = { value: "unfinished feedback", dataset: { composer: key }, focus() {} };
+    const box = Object.assign(new MockElement(), {
+        dataset: { key, kind: "line", path: "file.ts", side: "new", start: "2", end: "2", revision: "r1" },
+        querySelector: (selector: string) => selector === "textarea" ? textarea : { textContent: "Comment on L2" },
+    });
+    app.document.querySelectorAll = () => [box];
+    app.document.querySelector = (selector: string) => selector.startsWith(".composer") ? box : app.node(selector);
+    app.run(`composerHtml("hidden-change", { kind: "change", path: "other.ts", side: "new", startLine: 4, endLine: 4, alwaysOpen: true }); setDraft("hidden-change", "another unfinished comment")`);
+    app.run("render = () => {}; state.selection = { path: 'file.ts', hunk: 0, from: 1, to: 1, anchor: 1, full: false }");
+    await app.run("loadState()");
+    assert.equal(app.state.review.currentRevisionId, "r2");
+    assert.equal(app.state.selection, null, "old row indices are never reused on the new diff");
+    const pinnedKey = `pinned:r1:${key}`;
+    assert.equal(app.run(`getDraft(${JSON.stringify(pinnedKey)})`), "unfinished feedback");
+    assert.equal(textarea.dataset.composer, pinnedKey, "focus follows the migrated draft");
+    assert.equal(app.run(`getDraft(${JSON.stringify(key)})`), "", "the current revision can reuse the same selection");
+    const pinned = app.run(`composerHtml(${JSON.stringify(pinnedKey)}, pinnedComposers.get(${JSON.stringify(pinnedKey)}))`);
+    assert.match(pinned, /data-revision="r1"/);
+    assert.match(pinned, /unfinished feedback/);
+    const hidden = app.run(`composerHtml("pinned:r1:hidden-change", pinnedComposers.get("pinned:r1:hidden-change"))`);
+    assert.match(hidden, /data-revision="r1"/);
+    assert.match(hidden, /another unfinished comment/);
+    const current = app.run(`composerHtml(${JSON.stringify(key)}, { kind: "line", path: "file.ts", startLine: 2, endLine: 2, alwaysOpen: true })`);
+    assert.match(current, /data-revision="r2"/);
+    await app.run(`submit(${JSON.stringify(pinnedKey)})`);
+    assert.equal(posts[0].revisionId, "r1");
+    assert.equal(posts[0].body, "unfinished feedback");
+    assert.equal(app.read("pinnedComposers.size"), 1);
+    app.run(`closeComposer("pinned:r1:hidden-change", true)`);
+    assert.equal(app.read("pinnedComposers.size"), 0);
+});
+
+test("refresh drops empty selection contexts and pins later hidden drafts to the revision they were written against", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    const options = `{ kind: "line", path: "file.ts", side: "new", startLine: 2, endLine: 2, alwaysOpen: true }`;
+    app.run(`composerHtml("line:file.ts:new:2-2", ${options}); pinComposers()`);
+    assert.equal(app.read("pinnedComposers.size"), 0);
+    assert.equal(app.read("composerContexts.size"), 0);
+    app.state.review.currentRevisionId = "r2";
+    app.run(`composerHtml("line:file.ts:new:2-2", ${options}); setDraft("line:file.ts:new:2-2", "feedback on r2"); pinComposers()`);
+    assert.equal(app.read(`pinnedComposers.get("pinned:r2:line:file.ts:new:2-2").revisionId`), "r2");
+    app.state.review.currentRevisionId = "r3";
+    assert.match(app.run(`composerHtml("line:file.ts:new:2-2", ${options})`), /data-revision="r3"/);
+});
+
+test("refresh does not pin empty visible composers and keeps file drafts visible when a file leaves the diff", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    app.state.settings = settingsFixture();
+    const empty = { value: "", dataset: { composer: "line:file.ts:new:2-2" } };
+    const box = Object.assign(new MockElement(), {
+        dataset: { key: empty.dataset.composer, kind: "line", path: "file.ts", side: "new", start: "2", end: "2", revision: "r1" },
+        querySelector: (selector: string) => selector === "textarea" ? empty : null,
+    });
+    app.document.querySelectorAll = () => [box];
+    app.run(`composerHtml("file:gone.ts", { kind: "file", path: "gone.ts", alwaysOpen: true }); setDraft("file:gone.ts", "keep this file comment"); pinComposers()`);
+    assert.equal(app.read("pinnedComposers.size"), 1, "only the nonempty hidden file draft is pinned");
+    app.state.review.currentRevisionId = "r2";
+    app.run(`state.snapshot = { revisionId: "r2", files: [] }; state.view = { type: "file", path: "gone.ts" }; renderRuler = () => {}; render()`);
+    assert.equal(app.read("state.view.type"), "overview");
+    assert.match(app.node("#main").innerHTML, /keep this file comment/);
+    assert.match(app.node("#main").innerHTML, /data-kind="file".*data-path="gone.ts"/);
+});
+
+test("an in-flight submission completes the migrated draft without deleting a new current-revision draft", async () => {
+    let finishPost: (value: unknown) => void = () => { throw new Error("POST not started"); };
+    const app = await loadApp({
+        CSS: { escape: (value: string) => value },
+        fetch: async (_url: string, options?: { method?: string; body?: string }) => {
+            assert.equal(options?.method, "POST");
+            return new Promise((resolve) => { finishPost = resolve; });
+        },
+    });
+    app.state.review = reviewFixture();
+    const textarea = { value: "sending original", dataset: { composer: "line:file.ts:new:2-2" } };
+    const box = Object.assign(new MockElement(), {
+        dataset: { key: textarea.dataset.composer, kind: "line", path: "file.ts", side: "new", start: "2", end: "2", revision: "r1" },
+        querySelector: (selector: string) => selector === "textarea" ? textarea : null,
+    });
+    app.document.querySelectorAll = () => [box];
+    app.document.querySelector = (selector: string) => selector.startsWith(".composer") ? box : app.node(selector);
+    app.run("render = () => {}; loadState = async () => {}");
+    const submitted = app.run<Promise<void>>(`submit("line:file.ts:new:2-2")`);
+    app.run(`pinComposers(); state.review.currentRevisionId = "r2"; setDraft("line:file.ts:new:2-2", "new feedback")`);
+    finishPost(jsonResponse({}));
+    await submitted;
+    assert.equal(app.read("pinnedComposers.size"), 0);
+    assert.equal(app.run(`getDraft("line:file.ts:new:2-2")`), "new feedback");
+});
+
+test("pinned composer text and original revision survive reload and scope switches", async () => {
+    let activeReview = reviewFixture();
+    const fetch: MockFetch = async (url) => {
+        if (url === "/api/state") return jsonResponse({ review: activeReview, settings: settingsFixture() });
+        if (url.startsWith("/api/snapshot/")) return jsonResponse({ revisionId: activeReview.currentRevisionId, files: [] });
+        throw new Error(`unexpected request ${url}`);
+    };
+    const app = await loadApp({ fetch });
+    app.run("renderRuler = () => {}");
+    await app.run("loadState()");
+    const key = "line:file.ts:new:2-2";
+    app.run(`composerHtml(${JSON.stringify(key)}, { kind: "line", path: "file.ts", side: "new", startLine: 2, endLine: 2, revisionId: "r1", alwaysOpen: true }); setDraft(${JSON.stringify(key)}, "keep across reload"); pinComposers()`);
+    const pinnedKey = `pinned:r1:${key}`;
+    assert.ok(app.localStorage.getItem("sr:r:draft:" + pinnedKey));
+    assert.ok(app.localStorage.getItem("sr:r:pinned-composers"));
+
+    activeReview = reviewFixture({ reviewId: "pending-review", currentRevisionId: "p1", scope: "pending" });
+    await app.run("loadState()");
+    assert.equal(app.read("pinnedComposers.size"), 0, "another scope does not display this draft");
+    activeReview = reviewFixture();
+    await app.run("loadState()");
+    assert.equal(app.read(`pinnedComposers.get(${JSON.stringify(pinnedKey)}).revisionId`), "r1");
+    assert.match(app.run(`composerHtml(${JSON.stringify(pinnedKey)}, pinnedComposers.get(${JSON.stringify(pinnedKey)}))`), /keep across reload/);
+
+    const reloaded = await loadApp({ fetch, localStorage: app.localStorage });
+    reloaded.run("renderRuler = () => {}");
+    await reloaded.run("loadState()");
+    assert.equal(reloaded.read(`pinnedComposers.get(${JSON.stringify(pinnedKey)}).revisionId`), "r1");
+    assert.match(reloaded.run(`composerHtml(${JSON.stringify(pinnedKey)}, pinnedComposers.get(${JSON.stringify(pinnedKey)}))`), /keep across reload/);
 });
 
 test("the top bar shows the review scope, and the learning controls only when the settings are known", async () => {

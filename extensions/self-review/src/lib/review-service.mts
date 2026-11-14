@@ -392,33 +392,34 @@ function applyLesson(review: Review, { reviewId, threadId, messageId }: Pick<Les
     return lesson;
 }
 
-function matchesRevision(file: DiffFile, oldLines: string[], newLines: string[]) {
+function revisionContent(file: DiffFile, oldLines: string[]): string[] | null {
     let oldIndex = 0;
-    let newIndex = 0;
+    const lines: string[] = [];
     for (const hunk of file.hunks) {
         const oldStart = hunk.oldLines === 0 ? hunk.oldStart : hunk.oldStart - 1;
         const newStart = hunk.newLines === 0 ? hunk.newStart : hunk.newStart - 1;
-        if (oldStart < oldIndex || newStart < newIndex || oldStart - oldIndex !== newStart - newIndex) return false;
+        if (oldStart < oldIndex || oldStart > oldLines.length || newStart - lines.length !== oldStart - oldIndex) return null;
         while (oldIndex < oldStart) {
-            if (oldLines[oldIndex++] !== newLines[newIndex++]) return false;
+            lines.push(oldLines[oldIndex++]);
         }
         for (const row of hunk.rows) {
             if (row.o != null) {
-                if (row.o !== oldIndex + 1 || oldLines[oldIndex] !== row.s) return false;
+                if (row.o !== oldIndex + 1 || oldLines[oldIndex] !== row.s) return null;
                 oldIndex++;
             }
             if (row.n != null) {
-                if (row.n !== newIndex + 1 || newLines[newIndex] !== row.s) return false;
-                newIndex++;
+                if (row.n !== lines.length + 1) return null;
+                lines.push(row.s);
             }
         }
-        if (oldIndex !== oldStart + hunk.oldLines || newIndex !== newStart + hunk.newLines) return false;
+        if (oldIndex !== oldStart + hunk.oldLines || lines.length !== newStart + hunk.newLines) return null;
     }
-    if (oldLines.length - oldIndex !== newLines.length - newIndex) return false;
-    while (oldIndex < oldLines.length) {
-        if (oldLines[oldIndex++] !== newLines[newIndex++]) return false;
-    }
-    return true;
+    return lines.concat(oldLines.slice(oldIndex));
+}
+
+function matchesRevision(file: DiffFile, oldLines: string[], newLines: string[]) {
+    const lines = revisionContent(file, oldLines);
+    return lines !== null && lines.length === newLines.length && lines.every((line, i) => line === newLines[i]);
 }
 
 // A draft is held by the reviewer and has not been offered to the agent yet.
@@ -1067,11 +1068,21 @@ export class ReviewService extends EventEmitter {
     }
 
     async revisionLines(reviewId: string, revisionId: string, filePath: string) {
-        const content = await this.getFileContent(reviewId, revisionId, filePath);
-        if (!content.available) {
-            throw new ReviewError("conflict", `Cannot use ${filePath} from revision ${revisionId}: ${content.reason}. Refresh the review and check the selection before retrying.`);
+        const review = await this.getReview(reviewId);
+        this.git.safeJoin(review.repoRoot, filePath);
+        const snapshot = await this.getSnapshot(reviewId, revisionId);
+        const file = snapshot.files.find((entry) => entry.path === filePath);
+        if (!file || file.binary || file.status === "deleted") {
+            throw new ReviewError("conflict", `Cannot recover ${filePath} from revision ${revisionId}. Check the selection before retrying.`);
         }
-        return content.lines;
+        // Anchors must use immutable revision content, not the now-edited working file.
+        const base = file.status === "added" ? [] : await this.git.readCommitFile(review.repoRoot, snapshot.baseCommit, file.oldPath ?? filePath);
+        if (base?.[base.length - 1] === "") base.pop();
+        const lines = base && base.length <= MAX_FULL_FILE_LINES ? revisionContent(file, base) : null;
+        if (!lines || lines.length > MAX_FULL_FILE_LINES) {
+            throw new ReviewError("conflict", `Cannot recover full-file content for ${filePath} from revision ${revisionId}. Check the selection before retrying.`);
+        }
+        return lines;
     }
 
     // Everything the agent prompt needs for one message, resolved against the current revision.

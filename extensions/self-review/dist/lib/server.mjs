@@ -12,6 +12,7 @@ import { SUGGESTED_REVIEWERS } from "./agent-review.mjs";
 import { resolveDelivery } from "./settings.mjs";
 import { findOpenPullRequest } from "./pull-request.mjs";
 import { SettingsHttp, HttpError } from "./settings-http.mjs";
+import { ReviewWatcher } from "./review-watcher.mjs";
 const MAX_JSON = 1024 * 1024;
 const PULL_REQUEST_CACHE_MS = 30_000;
 const STATIC = {
@@ -84,6 +85,7 @@ function isReviewScope(value) {
 }
 export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findOpenPullRequest, }) {
     const settingsHttp = new SettingsHttp(settings, log);
+    const reviewWatcher = new ReviewWatcher(service, log);
     const token = randomBytes(24).toString("base64url");
     const clients = new Set();
     const pullRequestCache = new Map();
@@ -321,6 +323,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             const nextId = await service.openSibling(reviewId, body.scope);
             if (nextId !== reviewId) {
                 await onReviewChange(nextId);
+                await reviewWatcher.setReview(nextId);
                 service.changed(nextId, "scope");
             }
             return send(res, 200, { reviewId: nextId, scope: body.scope });
@@ -365,10 +368,13 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
     if (!address || typeof address === "string")
         throw new Error("Review server did not bind to a TCP address.");
     port = address.port;
+    await reviewWatcher.setReview(getReviewId());
     return {
         url: `http://127.0.0.1:${port}/?t=${token}`,
         notify: broadcast,
+        watchReview: (reviewId) => reviewWatcher.setReview(reviewId),
         async close() {
+            await reviewWatcher.close();
             clearInterval(heartbeat);
             clearTimeout(assetTimer);
             watcher?.close();

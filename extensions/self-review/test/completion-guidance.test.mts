@@ -27,7 +27,7 @@ test("completion guidance scopes automatic opening to completed coding tasks wit
         /Honor explicit user opt-outs and host permissions/,
         /Do not open or propose another review for read-only answers/,
         /investigations without code edits, planning/,
-        /reply in-thread and refresh that same review/,
+        /reply in-thread and keep that same review/,
         /not open another panel or create a review loop/,
         /Discover the live Self review canvas and its input\/action schemas/,
         /explicit repoPath/,
@@ -45,11 +45,18 @@ test("fallback guidance reports limitations and never authorizes paid reviews or
     for (const boundary of [
         /briefly propose the local Self Review canvas/,
         /state the limitation/,
-        /never claim it opened on an error/,
+        /Never claim it opened on an error/,
         /Do not silently substitute static HTML, install\/reload software, or switch checkouts/,
         /not authorization to run paid or multi-model agent reviews/,
         /commit, push, publish, or create a PR/,
     ]) assert.match(COMPLETION_REVIEW_GUIDANCE, boundary);
+});
+
+test("open panels refresh automatically while agents verify identity and retain manual fallback", () => {
+    assert.match(COMPLETION_REVIEW_GUIDANCE, /automatically refresh after debounced checkout changes/);
+    assert.match(COMPLETION_REVIEW_GUIDANCE, /agents need not manually refresh after each edit/);
+    assert.match(COMPLETION_REVIEW_GUIDANCE, /if no matching panel is open/);
+    assert.match(COMPLETION_REVIEW_GUIDANCE, /use manual refresh if automatic refresh is unavailable or the revision is stale/);
 });
 
 test("the runtime entry registers the documented hooks without replacing the system prompt", async () => {

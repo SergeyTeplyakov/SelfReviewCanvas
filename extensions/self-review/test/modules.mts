@@ -19,6 +19,7 @@ const store = await loadModule<typeof import("../src/lib/store.mjs")>("../dist/l
 const contracts = await loadModule<typeof import("../src/web/contracts.mjs")>("../dist/web/contracts.mjs");
 const settingsApi = await loadModule<typeof import("../src/web/settings-api.mjs")>("../dist/web/settings-api.mjs");
 const completionGuidance = await loadModule<typeof import("../src/lib/completion-guidance.mjs")>("../dist/lib/completion-guidance.mjs");
+const reviewWatcher = await loadModule<typeof import("../src/lib/review-watcher.mjs")>("../dist/lib/review-watcher.mjs");
 
 export const relocate = anchors.relocate;
 export const { AgentReview, FUSION_REVIEWER, SUGGESTED_REVIEWERS } = agentReview;
@@ -38,6 +39,7 @@ export const { Store, migrateLegacyDataRoot, defaultDataRoot } = store;
 export const { agentReviewDefaults, reviewOptions, settingsDocument, settingsPatch } = contracts;
 export const { createSettingsApi } = settingsApi;
 export const { completionHooks, COMPLETION_REVIEW_GUIDANCE } = completionGuidance;
+export const { ReviewWatcher } = reviewWatcher;
 
 export async function loadExtension(): Promise<void> {
     const extensionUrl = new URL("../dist/extension.mjs", import.meta.url).href;

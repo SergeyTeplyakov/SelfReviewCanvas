@@ -20,6 +20,7 @@ import type { Delivery } from "./delivery.mjs";
 import type { Review, ReviewService } from "./review-service.mjs";
 import type { SettingsService } from "./settings.mjs";
 import type { ReviewSkills } from "./review-skills.mjs";
+import { ReviewWatcher } from "./review-watcher.mjs";
 
 const MAX_JSON = 1024 * 1024;
 const PULL_REQUEST_CACHE_MS = 30_000;
@@ -133,9 +134,11 @@ export async function startReviewServer({
 }: StartReviewServerOptions): Promise<{
     url: string;
     notify: (event: string, data: unknown) => void;
+    watchReview(reviewId: string): Promise<void>;
     close(): Promise<void>;
 }> {
     const settingsHttp = new SettingsHttp(settings, log);
+    const reviewWatcher = new ReviewWatcher(service, log);
     const token = randomBytes(24).toString("base64url");
     const clients = new Set<ServerResponse>();
     const pullRequestCache = new Map<string, PullRequestCacheEntry>();
@@ -361,6 +364,7 @@ export async function startReviewServer({
             const nextId = await service.openSibling(reviewId, body.scope);
             if (nextId !== reviewId) {
                 await onReviewChange(nextId);
+                await reviewWatcher.setReview(nextId);
                 service.changed(nextId, "scope");
             }
             return send(res, 200, { reviewId: nextId, scope: body.scope });
@@ -401,11 +405,14 @@ export async function startReviewServer({
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Review server did not bind to a TCP address.");
     port = address.port;
+    await reviewWatcher.setReview(getReviewId());
 
     return {
         url: `http://127.0.0.1:${port}/?t=${token}`,
         notify: broadcast,
+        watchReview: (reviewId) => reviewWatcher.setReview(reviewId),
         async close() {
+            await reviewWatcher.close();
             clearInterval(heartbeat);
             clearTimeout(assetTimer);
             watcher?.close();

@@ -191,7 +191,7 @@ test("reopening applies explicit capture options and retains unspecified ones", 
     assert.equal((await service.getReview(id)).threads.length, 1);
 });
 
-test("out-of-hunk selections and prompt context reject changed working files instead of labeling live text as saved", async (t) => {
+test("out-of-hunk selections and prompt context recover saved content without labeling live text as saved", async (t) => {
     const { repo, text, service } = await fixture(t);
     const id = await service.ensureReview({ repoPath: repo, base: "main", context: 0 });
     const input = { kind: "line", path: "a.txt", side: "new", startLine: 50, endLine: 51, revisionId: "r1", body: "Explain these lines" } satisfies ThreadInput;
@@ -199,21 +199,24 @@ test("out-of-hunk selections and prompt context reject changed working files ins
     assert.deepEqual(required(thread.anchor).selectedLines, ["line 50", "line 51"]);
     assert.deepEqual((await service.promptContext(id, thread.threadId)).selected, ["line 50", "line 51"]);
     await writeFile(path.join(repo, "a.txt"), "inserted\n" + text);
-    await assert.rejects(service.createThread(id, input), (e: unknown) => hasErrorCode(e, "conflict"));
-    await assert.rejects(service.promptContext(id, thread.threadId), (e: unknown) => hasErrorCode(e, "conflict"));
+    const pinned = await service.createThread(id, input);
+    assert.deepEqual(required(pinned.thread.anchor).selectedLines, ["line 50", "line 51"]);
+    assert.deepEqual((await service.promptContext(id, thread.threadId)).selected, ["line 50", "line 51"]);
     const sent: SendOptions[] = [];
     const delivery = new Delivery({ service, send: async (options) => { sent.push(options); return "sm"; } });
-    assert.equal((await delivery.deliver(id, thread.threadId, message.messageId, "inst")).delivered, false);
-    assert.equal(sent.length, 0);
-    assert.equal(required((await service.findMessage(id, message.messageId)).message.delivery).state, "failed");
+    assert.equal((await delivery.deliver(id, thread.threadId, message.messageId, "inst")).delivered, true);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].prompt, /line 50\nline 51/);
+    assert.doesNotMatch(sent[0].prompt, /line 49\nline 50/);
     const captured = await service.createThread(id, { ...input, startLine: 5, endLine: 5 });
     assert.deepEqual(required(captured.thread.anchor).selectedLines, ["line 5 edited"], "saved hunk text remains usable");
     const old = await service.createThread(id, { ...input, side: "old" });
     assert.deepEqual(required(old.thread.anchor).selectedLines, ["line 50", "line 51"], "the committed old side is immutable");
     await service.refresh(id);
     assert.deepEqual((await service.promptContext(id, thread.threadId)).selected, ["line 50", "line 51"]);
-    assert.equal((await delivery.deliver(id, thread.threadId, message.messageId, "inst", { retry: true })).delivered, true);
-    await assert.rejects(service.createThread(id, input), (e: unknown) => hasErrorCode(e, "conflict"));
+    const original = await service.createThread(id, input);
+    assert.deepEqual(required(original.thread.anchor).selectedLines, ["line 50", "line 51"]);
+    assert.equal(required(original.thread.location).startLine, 51);
 });
 
 test("concurrent deliveries and retries claim one send, and stale retries do not reset active or replied messages", async (t) => {

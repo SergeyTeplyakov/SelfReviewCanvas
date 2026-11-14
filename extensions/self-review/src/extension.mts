@@ -147,6 +147,7 @@ async function ensureServer(instanceId: string, reviewId: string): Promise<Insta
     if (!entry.ready) throw new Error(`Review server for ${instanceId} was not initialized.`);
     const server = await entry.ready;
     entry.server = server;
+    await server.watchReview(reviewId);
     recoverClaims(reviewId);
     // A page that is already open keeps showing the previous review until told to reload.
     if (switched) service.changed(reviewId, "open");

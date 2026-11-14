@@ -212,6 +212,39 @@ test("full-file content handles separated zero-context insertions and deletions"
     assert.equal(stale.available ? null : stale.reason, "stale");
 });
 
+test("original-revision full-file drafts recover gaps from saved hunks and immutable renamed-file bases", async () => {
+    const otherRepo = await mkdtemp(path.join(tmp, "pinned-"));
+    await git(otherRepo, "init", "-q", "-b", "main");
+    await writeFile(path.join(otherRepo, "old.ts"), lines(100));
+    await git(otherRepo, "add", ".");
+    await git(otherRepo, "commit", "-qm", "base");
+    await git(otherRepo, "mv", "old.ts", "renamed.ts");
+    const updated: string[] = [];
+    for (let i = 1; i <= 100; i++) {
+        if (i !== 95) updated.push(i === 5 ? "changed line 5" : `line ${i}`);
+        if (i === 50) updated.push("inserted");
+    }
+    await writeFile(path.join(otherRepo, "renamed.ts"), updated.join("\n") + "\n");
+    await writeFile(path.join(otherRepo, "new.ts"), "original new file\n");
+    const id = await service.ensureReview({ repoPath: otherRepo, base: "main", context: 0 });
+    const snapshot = await service.getSnapshot(id);
+    const file = required(snapshot.files.find((entry) => entry.path === "renamed.ts"));
+    assert.equal(file.oldPath, "old.ts");
+    assert.equal(file.hunks.length, 3);
+    assert.ok(!file.hunks.some((hunk) => hunk.rows.some((row) => row.n === 20)));
+    await writeFile(path.join(otherRepo, "renamed.ts"), "different current content\n");
+    await writeFile(path.join(otherRepo, "new.ts"), "different new file\n");
+    await service.refresh(id);
+    assert.deepEqual(await service.revisionLines(id, "r1", "renamed.ts"), updated);
+    assert.deepEqual(await service.revisionLines(id, "r1", "new.ts"), ["original new file"]);
+    const { thread } = await service.createThread(id, {
+        kind: "line", revisionId: "r1", path: "renamed.ts", side: "new", startLine: 20, body: "Feedback on the original gap",
+    });
+    assert.deepEqual(required(thread.anchor).selectedLines, ["line 20"]);
+    assert.equal(required(thread.anchor).revisionId, "r1");
+    assert.equal(required(thread.location).state, "outdated", "removed original code is never silently attached to new code");
+});
+
 test("agent reply marks the comment replied and records lessons", async () => {
     const { message } = await service.addMessage(reviewId, lineThread.threadId, {
         author: "agent",
