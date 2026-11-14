@@ -199,7 +199,7 @@ test("HEAD/index changes in linked worktrees and shared base refs refresh; close
     count = f.count();
     await runGit(linked, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "feature"]);
     await until(async () => (await f.service.getReview(id)).git?.headCommit === (await runGit(linked, ["rev-parse", "HEAD"])).stdout.trim());
-    assert.ok(f.count() > count);
+    await until(() => f.count() > count);
     count = f.count();
     await f.git("update-ref", "refs/heads/main", (await runGit(linked, ["rev-parse", "HEAD"])).stdout.trim());
     await until(() => f.count() > count);
